@@ -7,6 +7,7 @@ mod line;
 mod rmc;
 
 pub use checksum::verify_checksum;
+pub use data::NmeaData;
 pub use error::ParseError;
 pub use line::{LineAssembler, MAX_LINE};
-pub use rmc::RMC;
+pub use rmc::build_rmc_struct;

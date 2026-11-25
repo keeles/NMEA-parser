@@ -1,4 +1,4 @@
-use crate::{MAX_LINE, ParseError, error::LineError};
+use crate::{ParseError, error::LineError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum RMCStatus {
@@ -8,15 +8,31 @@ enum RMCStatus {
 }
 
 #[derive(Debug, Default)]
+pub struct Date {
+    day: u8,
+    month: u8,
+    year: u16,
+}
+
+impl Date {
+    pub fn new(day: u8, month: u8, year: u16) -> Result<Date, ParseError> {
+        if day == 0 || day > 31 || month == 0 || month > 12 {
+            return Err(ParseError::InvalidDate);
+        }
+
+        Ok(Date { day, month, year })
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct RMC {
     utc_ms: u32,
     status: RMCStatus,
-    lat: i32,
-    lon: i32,
-    sog: u32,
-    angle: u32,
-    date: [u32; 6],
-    mag_var: u32,
+    lat_e7: i32,
+    lon_e7: i32,
+    sog_mms: u32,
+    angle_mdeg: u32,
+    date: Date,
 }
 
 impl RMC {
@@ -24,12 +40,11 @@ impl RMC {
         RMC {
             utc_ms: 0,
             status: RMCStatus::V,
-            lat: 0,
-            lon: 0,
-            sog: 0,
-            angle: 0,
-            date: [0; 6],
-            mag_var: 0,
+            lat_e7: 0,
+            lon_e7: 0,
+            sog_mms: 0,
+            angle_mdeg: 0,
+            date: Date::default(),
         }
     }
 }
@@ -55,37 +70,40 @@ pub fn build_rmc_struct(line: &[u8]) -> Result<RMC, LineError> {
                 };
             }
             2 => {
-                // store lat
-                rmc_data.lat = parse_coord(field)?;
+                // store lat_e7
+                rmc_data.lat_e7 = parse_coord(field)?;
             }
             3 => match field.first() {
                 Some(b'N') => {}
-                Some(b'S') => rmc_data.lat = -rmc_data.lat,
+                Some(b'S') => rmc_data.lat_e7 = -rmc_data.lat_e7,
                 None => {} // empty when there's no fix
                 _ => return Err(LineError::InvalidValue),
             },
             4 => {
-                // store lon
-                rmc_data.lon = parse_coord(field)?;
+                // store lon_e7
+                rmc_data.lon_e7 = parse_coord(field)?;
             }
             5 => match field.first() {
                 Some(b'E') => {}
-                Some(b'W') => rmc_data.lon = -rmc_data.lon,
+                Some(b'W') => rmc_data.lon_e7 = -rmc_data.lon_e7,
                 None => {}
                 _ => return Err(LineError::InvalidValue),
             },
             6 => {
                 // parse speed over ground
-                rmc_data.sog = parse_speed_mms(field)?;
+                rmc_data.sog_mms = parse_speed_mms(field)?;
             }
             7 => {
-                // TODO: parse course
+                let angle = parse_decimal_to_int(field, 3)?;
+                if angle >= 360_000 {
+                    return Err(LineError::InvalidValue);
+                }
+
+                rmc_data.angle_mdeg = parse_decimal_to_int(field, 3)?;
             }
             8 => {
-                // TODO: parse date
-            }
-            9 => {
-                // TODO: parse magnetic variation
+                let (day, month, year) = parse_date(field)?;
+                rmc_data.date = Date::new(day, month, year)?;
             }
             _ => continue,
         }
@@ -94,6 +112,23 @@ pub fn build_rmc_struct(line: &[u8]) -> Result<RMC, LineError> {
     Ok(rmc_data)
 }
 
+/// Takes a byte array of length 6, returns a tuple of day, month, year
+fn parse_date(bytes: &[u8]) -> Result<(u8, u8, u16), ParseError> {
+    if bytes.len() != 6 {
+        return Err(ParseError::InvalidDate);
+    }
+
+    let day = parse_u64(&bytes[0..2]).ok_or(ParseError::InvalidDate)?;
+    let day = u8::try_from(day).map_err(|_| ParseError::InvalidDate)?;
+    let month = parse_u64(&bytes[2..4]).ok_or(ParseError::InvalidDate)?;
+    let month = u8::try_from(month).map_err(|_| ParseError::InvalidDate)?;
+    let year = parse_u64(&bytes[4..6]).ok_or(ParseError::InvalidDate)?;
+    let year = u16::try_from(year).map_err(|_| ParseError::InvalidDate)?;
+
+    Ok((day, month, year))
+}
+
+/// Return utc time as u32
 fn parse_utc_ms(bytes: &[u8]) -> Result<u32, ParseError> {
     let (hms, frac) = match bytes.iter().position(|&b| b == b'.') {
         Some(i) => (&bytes[..i], &bytes[i + 1..]),
@@ -117,6 +152,28 @@ fn parse_utc_ms(bytes: &[u8]) -> Result<u32, ParseError> {
     Ok(((hh * 3600 + mm * 60 + ss) * 1000 + ms) as u32)
 }
 
+/// Takes a byte string of arbitrary length, splits at '.'
+/// returns an int representing a floating point number of the provided precision
+fn parse_decimal_to_int(bytes: &[u8], precision: u32) -> Result<u32, ParseError> {
+    let (int_part, frac_part) = match bytes.iter().position(|&b| b == b'.') {
+        Some(i) => (&bytes[..i], &bytes[i + 1..]),
+        None => (bytes, &[][..]), // tolerate "5" with no decimal point
+    };
+
+    let int = parse_u64(int_part).ok_or(ParseError::InvalidSpeed)?;
+    let int = u32::try_from(int).map_err(|_| ParseError::InvalidSpeed)?;
+    let frac = parse_decimal(frac_part, precision).ok_or(ParseError::InvalidSpeed)?;
+    let frac = u32::try_from(frac).map_err(|_| ParseError::InvalidSpeed)?;
+
+    let total = int
+        .checked_mul(10u32.pow(precision))
+        .and_then(|v| v.checked_add(frac))
+        .ok_or(ParseError::InvalidSpeed)?;
+    Ok(total)
+}
+
+/// Takes a byte array of speed in knots, splits at '.'
+/// returns speed as mm/s with decimal precision of 3
 fn parse_speed_mms(bytes: &[u8]) -> Result<u32, ParseError> {
     let (int_part, frac_part) = match bytes.iter().position(|&b| b == b'.') {
         Some(i) => (&bytes[..i], &bytes[i + 1..]),
@@ -140,6 +197,8 @@ fn parse_speed_mms(bytes: &[u8]) -> Result<u32, ParseError> {
     u32::try_from(mms).map_err(|_| ParseError::InvalidSpeed)
 }
 
+/// parses byte array into lat_e7 or lon_e7 coordinate
+/// decimal precision of 7
 fn parse_coord(bytes: &[u8]) -> Result<i32, ParseError> {
     let dot_idx = bytes
         .iter()
@@ -167,6 +226,7 @@ fn parse_coord(bytes: &[u8]) -> Result<i32, ParseError> {
     i32::try_from(total_deg_e7).map_err(|_| ParseError::InvalidCoordinate)
 }
 
+/// Takes byte array and returns u64 representation
 fn parse_u64(bytes: &[u8]) -> Option<u64> {
     bytes.iter().try_fold(0u64, |acc, &b| {
         if !b.is_ascii_digit() {
@@ -176,6 +236,7 @@ fn parse_u64(bytes: &[u8]) -> Option<u64> {
     })
 }
 
+/// Takes byte array and returns u64 representation of floating point of provided decimal precision
 fn parse_decimal(bytes: &[u8], precision: u32) -> Option<u64> {
     let mut acc = 0u64;
     let mut count = 0u32;
@@ -346,49 +407,44 @@ mod tests {
 
     #[test]
     fn speed_u64_overflow_is_an_error_not_a_panic() {
-        // Needs the checked-arithmetic fix below; panics in debug builds without it.
         assert!(matches!(
             parse_speed_mms(b"99999999999999.0"),
             Err(ParseError::InvalidSpeed)
         ));
     }
 
-    // ---------- build_rmc_struct ----------
-    // The time field is left empty in these: a non-empty one currently hits
-    // to_u32_array, which panics (see the ignored test at the bottom).
-
     #[test]
     fn rmc_full_sentence_north_east() {
         let rmc =
             build_rmc_struct(b",A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W").unwrap();
         assert_eq!(rmc.status, RMCStatus::A);
-        assert_eq!(rmc.lat, 481_173_000);
-        assert_eq!(rmc.lon, 115_166_667);
-        assert_eq!(rmc.sog, 11_524);
+        assert_eq!(rmc.lat_e7, 481_173_000);
+        assert_eq!(rmc.lon_e7, 115_166_667);
+        assert_eq!(rmc.sog_mms, 11_524);
     }
 
     #[test]
     fn rmc_south_west_are_negative() {
         let rmc = build_rmc_struct(b",A,3351.000,S,15112.000,W,000.0").unwrap();
-        assert_eq!(rmc.lat, -338_500_000);
-        assert_eq!(rmc.lon, -1_512_000_000);
-        assert_eq!(rmc.sog, 0);
+        assert_eq!(rmc.lat_e7, -338_500_000);
+        assert_eq!(rmc.lon_e7, -1_512_000_000);
+        assert_eq!(rmc.sog_mms, 0);
     }
 
     #[test]
     fn rmc_south_east_mixed() {
         let rmc = build_rmc_struct(b",A,3351.000,S,15112.000,E,0.0").unwrap();
-        assert_eq!(rmc.lat, -338_500_000);
-        assert_eq!(rmc.lon, 1_512_000_000);
+        assert_eq!(rmc.lat_e7, -338_500_000);
+        assert_eq!(rmc.lon_e7, 1_512_000_000);
     }
 
     #[test]
     fn rmc_no_fix_leaves_defaults() {
         let rmc = build_rmc_struct(b",V,,,,,,,,,").unwrap();
         assert_eq!(rmc.status, RMCStatus::V);
-        assert_eq!(rmc.lat, 0);
-        assert_eq!(rmc.lon, 0);
-        assert_eq!(rmc.sog, 0);
+        assert_eq!(rmc.lat_e7, 0);
+        assert_eq!(rmc.lon_e7, 0);
+        assert_eq!(rmc.sog_mms, 0);
     }
 
     #[test]
@@ -412,8 +468,217 @@ mod tests {
     }
 
     #[test]
-    fn rmc_with_real_time_field() {
-        let r = build_rmc_struct(b"123519.00,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W");
-        assert!(r.is_ok());
+    fn utc_known_values() {
+        let cases: &[(&[u8], u32)] = &[
+            (b"000000", 0),
+            (b"000000.00", 0),
+            (b"123519.00", 45_319_000), // 12:35:19
+            (b"123519", 45_319_000),    // no fraction
+            (b"123519.5", 45_319_500),
+            (b"123519.123", 45_319_123),
+            (b"123519.1234", 45_319_123), // extra digits truncated
+            (b"235959.999", 86_399_999),
+            (b"235960", 86_400_000), // leap second
+        ];
+        for &(input, expected) in cases {
+            assert_eq!(
+                parse_utc_ms(input).unwrap(),
+                expected,
+                "input {:?}",
+                core::str::from_utf8(input)
+            );
+        }
+    }
+
+    #[test]
+    fn utc_rejects_bad_input() {
+        let bad: &[&[u8]] = &[
+            b"12351",     // too short
+            b"1235190",   // too long before the dot
+            b"243000",    // hour 24
+            b"126000",    // minute 60
+            b"123561",    // second 61
+            b"12ab19.00", // non-digit
+            b"123519.0x", // garbage in fraction
+            b"",
+        ];
+        for &input in bad {
+            assert!(
+                matches!(parse_utc_ms(input), Err(ParseError::InvalidTime)),
+                "input {:?}",
+                core::str::from_utf8(input)
+            );
+        }
+    }
+
+    // ---------- parse_date ----------
+
+    #[test]
+    fn date_known_values() {
+        // Year is the raw two-digit value; update these when you add a century pivot.
+        let cases: &[(&[u8], (u8, u8, u16))] = &[
+            (b"230394", (23, 3, 94)),
+            (b"010100", (1, 1, 0)),
+            (b"311299", (31, 12, 99)),
+        ];
+        for &(input, expected) in cases {
+            assert_eq!(
+                parse_date(input).unwrap(),
+                expected,
+                "input {:?}",
+                core::str::from_utf8(input)
+            );
+        }
+    }
+
+    #[test]
+    fn date_rejects_malformed() {
+        let bad: &[&[u8]] = &[b"23039", b"2303944", b"", b"23a394", b"23-394"];
+        for &input in bad {
+            assert!(
+                matches!(parse_date(input), Err(ParseError::InvalidDate)),
+                "input {:?}",
+                core::str::from_utf8(input)
+            );
+        }
+    }
+
+    // ---------- Date::new ----------
+
+    #[test]
+    fn date_new_accepts_valid() {
+        let d = Date::new(31, 12, 99).unwrap();
+        assert_eq!((d.day, d.month, d.year), (31, 12, 99));
+        assert!(Date::new(1, 1, 0).is_ok());
+    }
+
+    #[test]
+    fn date_new_rejects_out_of_range() {
+        for (day, month) in [(0, 1), (32, 1), (1, 0), (1, 13), (0, 0)] {
+            assert!(
+                matches!(Date::new(day, month, 24), Err(ParseError::InvalidDate)),
+                "day {day} month {month}"
+            );
+        }
+    }
+
+    // ---------- parse_decimal_to_int ----------
+
+    #[test]
+    fn fixed_known_values() {
+        let cases: &[(&[u8], u32, u32)] = &[
+            (b"0.0", 3, 0),
+            (b"084.4", 3, 84_400),
+            (b"359.999", 3, 359_999),
+            (b"5", 3, 5_000),
+            (b".5", 3, 500),
+            (b"1.23456", 3, 1_234), // extra digits truncated
+            (b"12.3", 2, 1_230),
+            (b"12.34", 2, 1_234),
+        ];
+        for &(input, precision, expected) in cases {
+            assert_eq!(
+                parse_decimal_to_int(input, precision).unwrap(),
+                expected,
+                "input {:?}",
+                core::str::from_utf8(input)
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_rejects_bad_input() {
+        // Only is_err(): the helper currently reports InvalidSpeed even for course.
+        let bad: &[&[u8]] = &[b"abc", b"1.2x", b"1.2.3", b"-1.0", b"1,5"];
+        for &input in bad {
+            assert!(
+                parse_decimal_to_int(input, 3).is_err(),
+                "input {:?}",
+                core::str::from_utf8(input)
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_int_part_too_big_for_u32() {
+        assert!(parse_decimal_to_int(b"4294967296.0", 3).is_err());
+    }
+
+    // ---------- build_rmc_struct ----------
+
+    #[test]
+    fn rmc_full_sentence_every_field() {
+        let rmc =
+            build_rmc_struct(b"123519.00,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W")
+                .unwrap();
+        assert_eq!(rmc.utc_ms, 45_319_000);
+        assert_eq!(rmc.status, RMCStatus::A);
+        assert_eq!(rmc.lat_e7, 481_173_000);
+        assert_eq!(rmc.lon_e7, 115_166_667);
+        assert_eq!(rmc.sog_mms, 11_524);
+        assert_eq!(rmc.angle_mdeg, 84_400);
+        assert_eq!((rmc.date.day, rmc.date.month, rmc.date.year), (23, 3, 94));
+    }
+
+    #[test]
+    fn rmc_empty_course_does_not_shift_columns() {
+        let rmc = build_rmc_struct(b",A,4807.038,N,01131.000,E,022.4,,230394").unwrap();
+        assert_eq!(rmc.angle_mdeg, 0);
+        assert_eq!(rmc.sog_mms, 11_524);
+        assert_eq!((rmc.date.day, rmc.date.month), (23, 3));
+    }
+
+    #[test]
+    fn rmc_course_alone() {
+        let rmc = build_rmc_struct(b",A,,,,,,084.4").unwrap();
+        assert_eq!(rmc.angle_mdeg, 84_400);
+    }
+
+    #[test]
+    fn rmc_date_alone() {
+        let rmc = build_rmc_struct(b",,,,,,,,230394").unwrap();
+        assert_eq!((rmc.date.day, rmc.date.month, rmc.date.year), (23, 3, 94));
+    }
+
+    #[test]
+    fn rmc_no_date_leaves_default_date() {
+        let rmc = build_rmc_struct(b",A,4807.038,N,01131.000,E,022.4,084.4").unwrap();
+        assert_eq!((rmc.date.day, rmc.date.month, rmc.date.year), (0, 0, 0));
+    }
+
+    #[test]
+    fn rmc_bad_date_is_error() {
+        let bad: &[&[u8]] = &[
+            b",,,,,,,,000194", // day 0
+            b",,,,,,,,230094", // month 0
+            b",,,,,,,,231394", // month 13
+            b",,,,,,,,320194", // day 32
+            b",,,,,,,,2303",   // wrong length
+            b",,,,,,,,23a394", // non-digit
+        ];
+        for &input in bad {
+            assert!(
+                build_rmc_struct(input).is_err(),
+                "input {:?}",
+                core::str::from_utf8(input)
+            );
+        }
+    }
+
+    #[test]
+    fn rmc_bad_time_is_error() {
+        assert!(build_rmc_struct(b"246000,A").is_err());
+        assert!(build_rmc_struct(b"12ab19.00,A").is_err());
+    }
+
+    #[test]
+    fn fixed_overflow_is_an_error_not_a_panic() {
+        assert!(parse_decimal_to_int(b"99999999.0", 3).is_err());
+    }
+
+    #[test]
+    fn rmc_course_out_of_range_is_error() {
+        assert!(build_rmc_struct(b",A,,,,,,360.5").is_err());
+        assert!(build_rmc_struct(b",A,,,,,,999.9").is_err());
     }
 }

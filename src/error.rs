@@ -7,6 +7,7 @@ pub enum ParseError {
     InvalidCoordinate,
     InvalidSpeed,
     InvalidTime,
+    InvalidDate,
 }
 
 #[derive(Debug, PartialEq, Eq)]
