@@ -6,6 +6,7 @@ pub enum ParseError {
     ChecksumMismatch,
     InvalidCoordinate,
     InvalidSpeed,
+    InvalidCourse,
     InvalidTime,
     InvalidDate,
 }

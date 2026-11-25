@@ -62,7 +62,6 @@ pub fn build_rmc_struct(line: &[u8]) -> Result<RMC, LineError> {
                 rmc_data.utc_ms = parse_utc_ms(field)?;
             }
             1 => {
-                //store status
                 rmc_data.status = if field.first() == Some(&b'A') {
                     RMCStatus::A
                 } else {
@@ -70,7 +69,6 @@ pub fn build_rmc_struct(line: &[u8]) -> Result<RMC, LineError> {
                 };
             }
             2 => {
-                // store lat_e7
                 rmc_data.lat_e7 = parse_coord(field)?;
             }
             3 => match field.first() {
@@ -80,7 +78,6 @@ pub fn build_rmc_struct(line: &[u8]) -> Result<RMC, LineError> {
                 _ => return Err(LineError::InvalidValue),
             },
             4 => {
-                // store lon_e7
                 rmc_data.lon_e7 = parse_coord(field)?;
             }
             5 => match field.first() {
@@ -90,7 +87,6 @@ pub fn build_rmc_struct(line: &[u8]) -> Result<RMC, LineError> {
                 _ => return Err(LineError::InvalidValue),
             },
             6 => {
-                // parse speed over ground
                 rmc_data.sog_mms = parse_speed_mms(field)?;
             }
             7 => {
@@ -114,18 +110,16 @@ pub fn build_rmc_struct(line: &[u8]) -> Result<RMC, LineError> {
 
 /// Takes a byte array of length 6, returns a tuple of day, month, year
 fn parse_date(bytes: &[u8]) -> Result<(u8, u8, u16), ParseError> {
-    if bytes.len() != 6 {
-        return Err(ParseError::InvalidDate);
+    fn inner(bytes: &[u8]) -> Option<(u8, u8, u16)> {
+        if bytes.len() != 6 {
+            return None;
+        }
+        let day = u8::try_from(parse_u64(&bytes[0..2])?).ok()?;
+        let month = u8::try_from(parse_u64(&bytes[2..4])?).ok()?;
+        let year = u16::try_from(parse_u64(&bytes[4..6])?).ok()?;
+        Some((day, month, year))
     }
-
-    let day = parse_u64(&bytes[0..2]).ok_or(ParseError::InvalidDate)?;
-    let day = u8::try_from(day).map_err(|_| ParseError::InvalidDate)?;
-    let month = parse_u64(&bytes[2..4]).ok_or(ParseError::InvalidDate)?;
-    let month = u8::try_from(month).map_err(|_| ParseError::InvalidDate)?;
-    let year = parse_u64(&bytes[4..6]).ok_or(ParseError::InvalidDate)?;
-    let year = u16::try_from(year).map_err(|_| ParseError::InvalidDate)?;
-
-    Ok((day, month, year))
+    inner(bytes).ok_or(ParseError::InvalidDate)
 }
 
 /// Return utc time as u32
@@ -135,21 +129,24 @@ fn parse_utc_ms(bytes: &[u8]) -> Result<u32, ParseError> {
         None => (bytes, &[][..]), // some receivers omit the fraction
     };
 
-    if hms.len() != 6 {
-        return Err(ParseError::InvalidTime);
+    fn inner(hms: &[u8], frac: &[u8]) -> Option<u32> {
+        if hms.len() != 6 {
+            return None;
+        }
+
+        let hh = parse_u64(&hms[0..2])?;
+        let mm = parse_u64(&hms[2..4])?;
+        let ss = parse_u64(&hms[4..6])?;
+        let ms = parse_decimal(frac, 3)?;
+
+        if hh > 23 || mm > 59 || ss > 60 {
+            return None;
+        }
+
+        Some(((hh * 3600 + mm * 60 + ss) * 1000 + ms) as u32)
     }
 
-    let hh = parse_u64(&hms[0..2]).ok_or(ParseError::InvalidTime)?;
-    let mm = parse_u64(&hms[2..4]).ok_or(ParseError::InvalidTime)?;
-    let ss = parse_u64(&hms[4..6]).ok_or(ParseError::InvalidTime)?;
-    let ms = parse_decimal(frac, 3).ok_or(ParseError::InvalidTime)?;
-
-    // ss == 60 is a legal leap second
-    if hh > 23 || mm > 59 || ss > 60 {
-        return Err(ParseError::InvalidTime);
-    }
-
-    Ok(((hh * 3600 + mm * 60 + ss) * 1000 + ms) as u32)
+    inner(hms, frac).ok_or(ParseError::InvalidTime)
 }
 
 /// Takes a byte string of arbitrary length, splits at '.'
@@ -160,16 +157,18 @@ fn parse_decimal_to_int(bytes: &[u8], precision: u32) -> Result<u32, ParseError>
         None => (bytes, &[][..]), // tolerate "5" with no decimal point
     };
 
-    let int = parse_u64(int_part).ok_or(ParseError::InvalidSpeed)?;
-    let int = u32::try_from(int).map_err(|_| ParseError::InvalidSpeed)?;
-    let frac = parse_decimal(frac_part, precision).ok_or(ParseError::InvalidSpeed)?;
-    let frac = u32::try_from(frac).map_err(|_| ParseError::InvalidSpeed)?;
+    fn inner(int_part: &[u8], frac_part: &[u8], precision: u32) -> Option<u32> {
+        let int = parse_u64(int_part)? as u32;
+        let frac = parse_decimal(frac_part, precision)? as u32;
 
-    let total = int
-        .checked_mul(10u32.pow(precision))
-        .and_then(|v| v.checked_add(frac))
-        .ok_or(ParseError::InvalidSpeed)?;
-    Ok(total)
+        let total = int
+            .checked_mul(10u32.pow(precision))
+            .and_then(|v| v.checked_add(frac))?;
+
+        Some(total)
+    }
+
+    inner(int_part, frac_part, precision).ok_or(ParseError::InvalidSpeed)
 }
 
 /// Takes a byte array of speed in knots, splits at '.'
@@ -180,21 +179,21 @@ fn parse_speed_mms(bytes: &[u8]) -> Result<u32, ParseError> {
         None => (bytes, &[][..]), // tolerate "5" with no decimal point
     };
 
-    let int = parse_u64(int_part).ok_or(ParseError::InvalidSpeed)?;
-    let frac = parse_decimal(frac_part, 3).ok_or(ParseError::InvalidSpeed)?;
+    fn inner(int_part: &[u8], frac_part: &[u8], precision: u32) -> Option<u32> {
+        let int = parse_u64(int_part)?;
+        let frac = parse_decimal(frac_part, precision)?;
 
-    let milli_knots = int
-        .checked_mul(1000)
-        .and_then(|v| v.checked_add(frac))
-        .ok_or(ParseError::InvalidSpeed)?;
+        let milli_knots = int.checked_mul(1000).and_then(|v| v.checked_add(frac))?;
 
-    let mms = milli_knots
-        .checked_mul(1852)
-        .and_then(|v| v.checked_add(1800))
-        .ok_or(ParseError::InvalidSpeed)?
-        / 3600;
+        let mms = milli_knots
+            .checked_mul(1852)
+            .and_then(|v| v.checked_add(1800))? as u32;
+        let mms = mms / 3600;
 
-    u32::try_from(mms).map_err(|_| ParseError::InvalidSpeed)
+        Some(mms)
+    }
+
+    inner(int_part, frac_part, 3).ok_or(ParseError::InvalidSpeed)
 }
 
 /// parses byte array into lat_e7 or lon_e7 coordinate
