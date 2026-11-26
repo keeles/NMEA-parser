@@ -2,9 +2,14 @@
 
 mod checksum;
 mod data;
+mod date;
 mod error;
+mod gga;
+mod gsa;
 mod line;
+mod parse;
 mod rmc;
+mod sentence;
 
 pub use checksum::verify_checksum;
 pub use data::NmeaData;
