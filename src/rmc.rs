@@ -158,14 +158,14 @@ fn parse_decimal_to_int(bytes: &[u8], precision: u32) -> Result<u32, ParseError>
     };
 
     fn inner(int_part: &[u8], frac_part: &[u8], precision: u32) -> Option<u32> {
-        let int = parse_u64(int_part)? as u32;
-        let frac = parse_decimal(frac_part, precision)? as u32;
+        let int = parse_u64(int_part)?;
+        let frac = parse_decimal(frac_part, precision)?;
 
         let total = int
-            .checked_mul(10u32.pow(precision))
+            .checked_mul(10u64.pow(precision))
             .and_then(|v| v.checked_add(frac))?;
 
-        Some(total)
+        u32::try_from(total).ok()
     }
 
     inner(int_part, frac_part, precision).ok_or(ParseError::InvalidSpeed)
@@ -187,10 +187,10 @@ fn parse_speed_mms(bytes: &[u8]) -> Result<u32, ParseError> {
 
         let mms = milli_knots
             .checked_mul(1852)
-            .and_then(|v| v.checked_add(1800))? as u32;
+            .and_then(|v| v.checked_add(1800))?;
         let mms = mms / 3600;
 
-        Some(mms)
+        u32::try_from(mms).ok()
     }
 
     inner(int_part, frac_part, 3).ok_or(ParseError::InvalidSpeed)
@@ -199,30 +199,30 @@ fn parse_speed_mms(bytes: &[u8]) -> Result<u32, ParseError> {
 /// parses byte array into lat_e7 or lon_e7 coordinate
 /// decimal precision of 7
 fn parse_coord(bytes: &[u8]) -> Result<i32, ParseError> {
-    let dot_idx = bytes
-        .iter()
-        .position(|&b| b == b'.')
-        .ok_or(ParseError::InvalidCoordinate)?;
+    fn inner(bytes: &[u8]) -> Option<i32> {
+        let dot_idx = bytes.iter().position(|&b| b == b'.')?;
+        if dot_idx < 3 {
+            return None;
+        }
 
-    if dot_idx < 3 {
-        return Err(ParseError::InvalidCoordinate);
+        let int_part = &bytes[..dot_idx];
+        let deg = parse_u64(&int_part[..int_part.len() - 2])?;
+        let mins = parse_u64(&int_part[int_part.len() - 2..])?;
+
+        if mins >= 60 || deg > 180 {
+            return None;
+        }
+
+        let frac = parse_decimal(&bytes[dot_idx + 1..], 7)?;
+
+        // minutes scaled by 10^7, round (+30), divide by 60 -> fractional degrees
+        let total_mins_e7 = mins * 10_000_000 + frac;
+        let total_deg_e7 = deg * 10_000_000 + (total_mins_e7 + 30) / 60;
+
+        i32::try_from(total_deg_e7).ok()
     }
 
-    let int_part = &bytes[..dot_idx];
-    let deg = parse_u64(&int_part[..int_part.len() - 2]).ok_or(ParseError::InvalidCoordinate)?;
-    let mins = parse_u64(&int_part[int_part.len() - 2..]).ok_or(ParseError::InvalidCoordinate)?;
-
-    if mins >= 60 || deg > 180 {
-        return Err(ParseError::InvalidCoordinate);
-    }
-
-    let frac = parse_decimal(&bytes[dot_idx + 1..], 7).ok_or(ParseError::InvalidCoordinate)?;
-
-    // Combine minutes (scaled by 10^7), round (+30), and divide by 60 to get fractional degrees
-    let total_mins_e7 = mins * 10_000_000 + frac;
-    let total_deg_e7 = deg * 10_000_000 + (total_mins_e7 + 30) / 60;
-
-    i32::try_from(total_deg_e7).map_err(|_| ParseError::InvalidCoordinate)
+    inner(bytes).ok_or(ParseError::InvalidCoordinate)
 }
 
 /// Takes byte array and returns u64 representation
