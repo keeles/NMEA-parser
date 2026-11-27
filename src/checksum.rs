@@ -20,9 +20,11 @@ pub fn verify_checksum(line: &[u8]) -> Result<&[u8], ParseError> {
         return Err(ParseError::BadChecksumHex);
     };
 
+    // get hex value for each nibble
     let hi_val = hex_val(*hi).ok_or(ParseError::BadChecksumHex)?;
     let lo_val = hex_val(*lo).ok_or(ParseError::BadChecksumHex)?;
 
+    // bitshift hi_val, XOR with lo_val to get single byte checksum
     let checksum = (hi_val << 4) | lo_val;
     let sum = payload.iter().fold(0, |acc, &b| acc ^ b);
 
